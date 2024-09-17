@@ -1,0 +1,10 @@
+langchain
+langchain_community
+langchain_core
+langchain_text_splitters
+ipykernel
+streamlit
+pathlib
+langchain_groq
+python-dotenv
+mysql
