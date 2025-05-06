@@ -1,89 +1,178 @@
 import streamlit as st
+import os
 from pathlib import Path
+import sqlite3
+import pandas as pd
+
 from langchain.agents import create_sql_agent
 from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_types import AgentType
-from langchain.callbacks import StreamlitCallbackHandler
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
-from sqlalchemy import create_engine
-import sqlite3
+
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
-load_dotenv()
-import os
+from sqlalchemy import create_engine, inspect
 
-groq_api_key = os.getenv("groq_api_key")
-st.set_page_config(page_title="Langchain : Chat with SQL DB", page_icon="🦜")
-st.title("Langchain: Chat with SQL DB")
-
-LOCALDB = "USE_LOCALDB"
-MYSQL = "USE_MYSQL"
-
-radio_opt = ["Use SQLite 3 Database - Student.db", "Connect to your SQL Database"]
-
-selected_opt = st.sidebar.radio(label="Choose the DB which you want to chat", options=radio_opt)
-
-if radio_opt.index(selected_opt) == 1:
-    db_uri = MYSQL
-    mysql_host = st.sidebar.text_input("Provide MySQL host")
-    mysql_user = st.sidebar.text_input(" MySQL User")
-    mysql_password = st.sidebar.text_input(" MySQL password", type="password")
-    mysql_db = st.sidebar.text_input("MySQL Database")
-else:
-    db_uri=LOCALDB
-
-api_key = st.sidebar.text_input(label="GROQ Api Key", type="password")
-
-if not db_uri:
-    st.info("Please enter the database information and URI")
-
-if not api_key:
-    st.info("Please enter the GROQ Api Key")
-
-llm = ChatGroq(api_key=api_key, model= "Llama3-8b-8192", streaming=True)
-
-
-@st.cache_resource(ttl="2h")
-def configure_db(db_uri, mysql_host=None, mysql_user=None, mysql_password=None, mysql_db=None):
-    if db_uri==LOCALDB:
-        dbfilepath = (Path(__file__).parent/"student.db").absolute()
-        print(dbfilepath)
-        creator = lambda: sqlite3.connect(f"file:{dbfilepath}?mode=ro", uri=True)
-        return SQLDatabase(create_engine("sqlite:///", creator=creator))
-    elif db_uri==MYSQL:
-        if not (mysql_host and mysql_user and mysql_password and mysql_db):
-            st.error("Please provide all MySQL connection details")
-            st.stop()
-        return SQLDatabase(create_engine(f"mysql+mysqlconnector://{mysql_user}:{mysql_password}@{mysql_host}/{mysql_db}"))   
+def create_friendly_response(query, sql_result):
+    """
+    Generate a more conversational and context-aware response
     
-if db_uri==MYSQL:
-    db=configure_db(db_uri, mysql_host, mysql_user, mysql_password, mysql_db)
-else:
-    db=configure_db(db_uri)
+    Args:
+        query (str): User's original query
+        sql_result (str): Result from SQL query
+    
+    Returns:
+        str: Friendly, informative response
+    """
+    # Greetings and basic interactions
+    query_lower = query.lower()
+    
+    if any(greeting in query_lower for greeting in ['hi', 'hello', 'hey']):
+        return "Hello there! I'm your friendly database assistant. What would you like to know?"
+    
+    # General response handling
+    if 'most' in query_lower or 'highest' in query_lower or 'top' in query_lower:
+        return f"I found an interesting insight: {sql_result}. Would you like more details?"
+    
+    # Fallback to direct SQL result
+    return f"Here's what I found: {sql_result}. Is there anything specific you'd like to know about this?"
 
-toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+def preview_database_schema(engine):
+    """
+    Retrieve and display database schema information
+    
+    Args:
+        engine (sqlalchemy.engine.base.Engine): SQLAlchemy engine
+    
+    Returns:
+        dict: Dictionary of table schemas and sample data
+    """
+    # Get inspector
+    inspector = inspect(engine)
+    
+    # Get table names
+    tables = inspector.get_table_names()
+    
+    # Collect schema and sample data
+    schema_info = {}
+    for table in tables:
+        # Get column information
+        columns = inspector.get_columns(table)
+        column_details = [
+            f"{col['name']} ({col['type']})" 
+            for col in columns
+        ]
+        
+        # Get sample data
+        try:
+            with engine.connect() as connection:
+                sample_data = pd.read_sql(f"SELECT * FROM {table} LIMIT 25", connection)
+                schema_info[table] = {
+                    'columns': column_details,
+                    'sample_data': sample_data
+                }
+        except Exception as e:
+            schema_info[table] = {
+                'columns': column_details,
+                'sample_data': f"Error retrieving sample data: {str(e)}"
+            }
+    
+    return schema_info
 
-agent = create_sql_agent(
-    llm=llm,
-    toolkit=toolkit,
-    verbose=True,
-    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION
-)
+def main():
+    st.set_page_config(
+        page_title="Database Query Assistant", 
+        page_icon="📊", 
+        layout="wide"
+    )
+    st.title("🔍 Database Query Companion")
+    st.sidebar.title("Database Configuration")
 
-if "messages" not in st.session_state or st.sidebar.button("Clear message history"):
-    st.session_state["messages"] = [{"role": "assistant", "content":"Hi, How can I help you?"}]
+    # Database and API Key Configuration
+    db_path = Path(__file__).parent / "student.db"
+    api_key = st.sidebar.text_input("GROQ API Key", type="password")
 
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
+    if not api_key:
+        st.info("Please enter your GROQ API Key to get started.")
+        return
 
-user_query = st.chat_input(placeholder="Ask anything from the database")
+    # Database Connection
+    try:
+        # Create SQLAlchemy engine directly
+        engine = create_engine(f"sqlite:///{db_path}")
+        
+        # Create SQLDatabase with the engine
+        db = SQLDatabase(engine)
 
-if user_query:
-    st.session_state.messages.append({"role":"user", "content":user_query})
-    st.chat_message("user").write(user_query)
+        # Database Schema Preview
+        st.sidebar.header("Database Preview")
+        if st.sidebar.button("Show Database Schema"):
+            with st.sidebar.expander("Database Schema and Sample Data"):
+                schema_info = preview_database_schema(engine)
+                for table, details in schema_info.items():
+                    st.write(f"### Table: {table}")
+                    st.write("**Columns:**")
+                    st.write(", ".join(details['columns']))
+                    
+                    st.write("**Sample Data:**")
+                    if isinstance(details['sample_data'], pd.DataFrame):
+                        st.dataframe(details['sample_data'])
+                    else:
+                        st.write(details['sample_data'])
 
-    with st.chat_message("assistant"):
-        streamlit_callback = StreamlitCallbackHandler(st.container())
-        response = agent.run(user_query, callbacks=[streamlit_callback])
-        st.session_state.messages.append({"role":"assistant", "content":"response"})
-        st.write(response)
+        # LLM Configuration
+        llm = ChatGroq(
+            api_key=api_key, 
+            model="Llama3-8b-8192", 
+            streaming=True
+        )
+
+        # SQL Agent Setup
+        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        agent = create_sql_agent(
+            llm=llm,
+            toolkit=toolkit,
+            verbose=False,
+            agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            handle_parsing_errors=True
+        )
+
+        # Chat Session Initialization
+        if "messages" not in st.session_state:
+            st.session_state.messages = [
+                {"role": "assistant", "content": "Hi there! I'm your database assistant. Click 'Show Database Schema' in the sidebar to explore the data, then ask me anything!"}
+            ]
+
+        # Display Chat History
+        for msg in st.session_state.messages:
+            st.chat_message(msg["role"]).write(msg["content"])
+
+        # User Input Handling
+        if user_query := st.chat_input("Ask a query about the database"):
+            # Add user query to session
+            st.session_state.messages.append({"role": "user", "content": user_query})
+            st.chat_message("user").write(user_query)
+
+            # Process Query
+            with st.chat_message("assistant"):
+                try:
+                    # Run the agent to get SQL result
+                    sql_result = agent.run(user_query)
+                    
+                    # Generate friendly response
+                    friendly_response = create_friendly_response(user_query, sql_result)
+                    
+                    # Display and store response
+                    st.write(friendly_response)
+                    st.session_state.messages.append({"role": "assistant", "content": friendly_response})
+
+                except Exception as e:
+                    error_msg = f"Oops! I'm having trouble understanding that query. Error: {e}"
+                    st.write(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    main()
